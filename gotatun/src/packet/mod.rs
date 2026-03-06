@@ -164,6 +164,11 @@ impl<T: CheckedPayload + ?Sized> Packet<T> {
         &self.inner.buf
     }
 
+    /// Get direct mutable access to the backing buffer.
+    pub fn buf_mut(&mut self) -> &mut BytesMut {
+        &mut self.inner.buf
+    }
+
     /// Create a `Packet<T>` from a `&T`.
     pub fn copy_from(payload: &T) -> Self {
         Self {
@@ -255,11 +260,6 @@ impl Packet<[u8]> {
     /// See [`BytesMut::truncate`].
     pub fn truncate(&mut self, new_len: usize) {
         self.inner.buf.truncate(new_len);
-    }
-
-    /// Get direct mutable access to the backing buffer.
-    pub fn buf_mut(&mut self) -> &mut BytesMut {
-        &mut self.inner.buf
     }
 
     /// Try to cast this untyped packet into an [`Ip`].
