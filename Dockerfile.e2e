@@ -1,0 +1,16 @@
+FROM rust:1-bookworm
+
+# Install Docker CLI + daemon, networking tools, kmod for kernel module loading
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    docker.io \
+    iproute2 \
+    iputils-ping \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /workspace
+COPY . .
+
+COPY run-e2e-tests-inner.sh /usr/local/bin/run-e2e-tests-inner.sh
+RUN chmod +x /usr/local/bin/run-e2e-tests-inner.sh
+
+ENTRYPOINT ["/usr/local/bin/run-e2e-tests-inner.sh"]

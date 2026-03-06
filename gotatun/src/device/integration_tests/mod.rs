@@ -15,6 +15,7 @@
 #[cfg(all(test, not(target_os = "macos"), not(target_os = "windows")))]
 mod tests {
     use crate::device::{DefaultDeviceTransports, Device, DeviceBuilder};
+    use crate::noise::awg::{AwgConfig, MagicHeader};
     use crate::udp::socket::UdpSocketFactory;
     use crate::x25519::{PublicKey, StaticSecret};
     use base64::Engine as _;
@@ -94,6 +95,55 @@ mod tests {
         }
     }
 
+    /// Docker network name for IPv6 endpoint tests
+    const DOCKER_IPV6_NETWORK: &str = "gotatun-e2e";
+    /// Known gateway for the IPv6 test network (fd00:e2e::/64)
+    const DOCKER_IPV6_GATEWAY: &str = "fd00:e2e::1";
+
+    /// Get the Docker bridge gateway IP (set by run-e2e-tests-inner.sh)
+    fn docker_bridge_gateway() -> IpAddr {
+        std::env::var("DOCKER_BRIDGE_GATEWAY")
+            .expect("DOCKER_BRIDGE_GATEWAY not set - are you running via run-e2e-tests.sh?")
+            .parse()
+            .expect("Invalid DOCKER_BRIDGE_GATEWAY")
+    }
+
+    /// Get the IPv4 address of a running Docker container
+    fn docker_container_ip(container_name: &str) -> IpAddr {
+        let output = Command::new("docker")
+            .args([
+                "inspect",
+                "-f",
+                "{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}",
+                container_name,
+            ])
+            .output()
+            .expect("Failed to inspect Docker container");
+        String::from_utf8(output.stdout)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap_or_else(|e| panic!("Failed to parse container IP for {container_name}: {e}"))
+    }
+
+    /// Get the IPv6 address of a running Docker container
+    fn docker_container_ipv6(container_name: &str) -> IpAddr {
+        let output = Command::new("docker")
+            .args([
+                "inspect",
+                "-f",
+                "{{range .NetworkSettings.Networks}}{{.GlobalIPv6Address}}{{end}}",
+                container_name,
+            ])
+            .output()
+            .expect("Failed to inspect Docker container");
+        String::from_utf8(output.stdout)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap_or_else(|e| panic!("Failed to parse container IPv6 for {container_name}: {e}"))
+    }
+
     impl Peer {
         /// Create a new peer with a given endpoint and a list of allowed IPs
         fn new(endpoint: SocketAddr, allowed_ips: Vec<AllowedIp>) -> Peer {
@@ -111,6 +161,7 @@ mod tests {
             local_key: &PublicKey,
             local_addr: &IpAddr,
             local_port: u16,
+            local_endpoint_host: &IpAddr,
         ) -> String {
             let mut conf = String::from("[Interface]\n");
             // Each allowed ip, becomes a possible address in the config
@@ -136,7 +187,10 @@ mod tests {
                 BASE64_STANDARD.encode(local_key.as_bytes())
             );
             let _ = writeln!(conf, "AllowedIPs = {local_addr}");
-            let _ = write!(conf, "Endpoint = 127.0.0.1:{local_port}");
+            // Use the bridge gateway IP so the peer can reach gotatun via the Docker bridge
+            // Format IPv6 endpoints with brackets: [addr]:port
+            let endpoint = SocketAddr::new(*local_endpoint_host, local_port);
+            let _ = write!(conf, "Endpoint = {endpoint}");
 
             conf
         }
@@ -161,47 +215,77 @@ mod tests {
             local_addr: &IpAddr,
             local_port: u16,
         ) {
-            let peer_config = self.gen_wg_conf(local_key, local_addr, local_port);
+            let want_ipv6 = self.endpoint.ip().is_ipv6();
+            let gateway: IpAddr = if want_ipv6 {
+                DOCKER_IPV6_GATEWAY.parse().unwrap()
+            } else {
+                docker_bridge_gateway()
+            };
+
+            let peer_config = self.gen_wg_conf(local_key, local_addr, local_port, &gateway);
             let peer_config_file = temp_path();
             std::fs::write(&peer_config_file, peer_config).unwrap();
             let nginx_config = self.gen_nginx_conf();
             let nginx_config_file = format!("{peer_config_file}.ngx");
             std::fs::write(&nginx_config_file, nginx_config).unwrap();
 
+            let container_name = &peer_config_file[5..];
+            let wg_vol = format!("{peer_config_file}:/wireguard/wg.conf");
+            let nginx_vol = format!("{nginx_config_file}:/etc/nginx/conf.d/default.conf");
+
+            let mut args = vec![
+                "run",
+                "-d",
+                "--cap-add=NET_ADMIN",
+                "--device=/dev/net/tun",
+                "--sysctl",
+                "net.ipv6.conf.all.disable_ipv6=0",
+                "--sysctl",
+                "net.ipv6.conf.default.disable_ipv6=0",
+            ];
+
+            // Use IPv6-capable network for IPv6 endpoint tests
+            if want_ipv6 {
+                args.extend_from_slice(&["--network", DOCKER_IPV6_NETWORK]);
+            }
+
+            args.extend_from_slice(&[
+                "-v",
+                &wg_vol,
+                "-v",
+                &nginx_vol,
+                "--rm",
+                "--name",
+                container_name,
+                "vkrasnov/wireguard-test",
+            ]);
+
             Command::new("docker")
-                .args([
-                    "run",                 // Run docker
-                    "-d",                  // In detached mode
-                    "--cap-add=NET_ADMIN", // Grant permissions to open a tunnel
-                    "--device=/dev/net/tun",
-                    "--sysctl", // Enable ipv6
-                    "net.ipv6.conf.all.disable_ipv6=0",
-                    "--sysctl",
-                    "net.ipv6.conf.default.disable_ipv6=0",
-                    "-p", // Open port for the endpoint
-                    &format!("{0}:{0}/udp", self.endpoint.port()),
-                    "-v", // Map the generated WireGuard config file
-                    &format!("{peer_config_file}:/wireguard/wg.conf"),
-                    "-v", // Map the nginx config file
-                    &format!("{nginx_config_file}:/etc/nginx/conf.d/default.conf"),
-                    "--rm", // Cleanup
-                    "--name",
-                    &peer_config_file[5..],
-                    "vkrasnov/wireguard-test",
-                ])
+                .args(&args)
                 .status()
                 .expect("Failed to run docker");
+
+            // Get the container's bridge IP and update the endpoint
+            let container_ip = if want_ipv6 {
+                docker_container_ipv6(container_name)
+            } else {
+                docker_container_ip(container_name)
+            };
+            self.endpoint = SocketAddr::new(container_ip, self.endpoint.port());
 
             self.container_name = Some(peer_config_file);
         }
 
         fn connect(&self) -> std::net::TcpStream {
             let http_addr = SocketAddr::new(self.allowed_ips[0].ip, 80);
-            for _i in 0..5 {
-                let res = std::net::TcpStream::connect(http_addr);
+            for _i in 0..10 {
+                let res = std::net::TcpStream::connect_timeout(
+                    &http_addr,
+                    std::time::Duration::from_secs(5),
+                );
                 if let Err(err) = res {
                     println!("failed to connect: {err:?}");
-                    std::thread::sleep(std::time::Duration::from_millis(100));
+                    std::thread::sleep(std::time::Duration::from_millis(500));
                     continue;
                 }
 
@@ -276,19 +360,32 @@ mod tests {
     impl WGHandle {
         /// Create a new interface for the tunnel with the given address
         async fn init(addr_v4: IpAddr, addr_v6: IpAddr) -> WGHandle {
+            Self::init_with_awg(addr_v4, addr_v6, None).await
+        }
+
+        /// Create a new interface with optional AmneziaWG obfuscation config
+        async fn init_with_awg(
+            addr_v4: IpAddr,
+            addr_v6: IpAddr,
+            awg: Option<AwgConfig>,
+        ) -> WGHandle {
             // Generate a new name, utun100+ should work on macOS and Linux
             let tun_name = format!("utun{}", NEXT_IFACE_IDX.fetch_add(1, Ordering::Relaxed));
 
             let uapi = crate::device::uapi::UapiServer::default_unix_socket(&tun_name, None, None)
                 .unwrap();
 
-            let device_builder = DeviceBuilder::new()
+            let mut builder = DeviceBuilder::new()
                 .create_tun(&tun_name)
                 .unwrap()
                 .with_udp(UdpSocketFactory)
                 .with_uapi(uapi);
 
-            let _device = device_builder.build().await.unwrap();
+            if let Some(awg) = awg {
+                builder = builder.with_awg(awg);
+            }
+
+            let _device = builder.build().await.unwrap();
 
             WGHandle {
                 _device,
@@ -489,7 +586,7 @@ mod tests {
         path
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[ignore]
     /// Test if wireguard starts and creates a unix socket that we can read from
     async fn test_wireguard_get() {
@@ -501,7 +598,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[ignore]
     /// Test if wireguard starts and creates a unix socket that we can use to set settings
     async fn test_wireguard_set() {
@@ -560,7 +657,7 @@ mod tests {
     }
 
     /// Test if wireguard can handle simple ipv4 connections
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[ignore]
     async fn test_wg_start_ipv4() {
         let port = next_port();
@@ -595,7 +692,7 @@ mod tests {
         assert_eq!(response, encode(PublicKey::from(&peer.key).as_bytes()));
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[ignore]
     /// Test if wireguard can handle simple ipv6 connections
     async fn test_wg_start_ipv6() {
@@ -631,10 +728,16 @@ mod tests {
     }
 
     /// Test if wireguard can handle connection with an ipv6 endpoint
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[ignore]
     #[cfg(target_os = "linux")] // Can't make docker work with ipv6 on macOS ATM
     async fn test_wg_start_ipv6_endpoint() {
+        // Skip if the host has IPv6 disabled (detected by run-e2e-tests.sh on the host)
+        if std::env::var("E2E_SKIP_IPV6_ENDPOINT").is_ok() {
+            eprintln!("Skipping test: host has IPv6 disabled (E2E_SKIP_IPV6_ENDPOINT set)");
+            return;
+        }
+
         let port = next_port();
         let private_key = StaticSecret::random_from_rng(rand_core::OsRng);
         let public_key = PublicKey::from(&private_key);
@@ -670,7 +773,7 @@ mod tests {
     }
 
     /// Test many concurrent connections
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[ignore]
     async fn test_wg_concurrent() {
         let port = next_port();
@@ -721,7 +824,7 @@ mod tests {
     }
 
     /// Test many concurrent connections
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[ignore]
     async fn test_wg_concurrent_v6() {
         let port = next_port();
@@ -769,5 +872,98 @@ mod tests {
         for t in threads {
             t.join().unwrap();
         }
+    }
+
+    /// AWG config used by AmneziaWG e2e tests — non-trivial obfuscation settings.
+    fn test_awg_config() -> AwgConfig {
+        AwgConfig {
+            h1: MagicHeader::range(1000, 1100),
+            h2: MagicHeader::range(2000, 2100),
+            h3: MagicHeader::range(3000, 3100),
+            h4: MagicHeader::range(4000, 4100),
+            s1: 32,
+            s2: 32,
+            s3: 0,
+            s4: 0,
+            jc: 3,
+            jmin: 50,
+            jmax: 150,
+        }
+    }
+
+    /// Test AmneziaWG handshake between two gotatun instances over localhost UDP.
+    /// Uses non-trivial AWG obfuscation (custom headers, padding, junk packets)
+    /// and verifies the handshake completes via persistent_keepalive triggering traffic.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[ignore]
+    async fn test_awg_handshake() {
+        let awg = test_awg_config();
+
+        let port_a = next_port();
+        let port_b = next_port();
+        let key_a = StaticSecret::random_from_rng(OsRng);
+        let key_b = StaticSecret::random_from_rng(OsRng);
+        let pub_a = PublicKey::from(&key_a);
+        let pub_b = PublicKey::from(&key_b);
+
+        let addr_a = next_ip();
+        let addr_b = next_ip();
+        let addr_v6_a = next_ip_v6();
+        let addr_v6_b = next_ip_v6();
+
+        // Create two gotatun devices with matching AWG config
+        let wg_a = WGHandle::init_with_awg(addr_a, addr_v6_a, Some(awg.clone())).await;
+        assert_eq!(wg_a.wg_set_port(port_a).await, "errno=0\n\n");
+        assert_eq!(wg_a.wg_set_key(key_a).await, "errno=0\n\n");
+
+        let wg_b = WGHandle::init_with_awg(addr_b, addr_v6_b, Some(awg)).await;
+        assert_eq!(wg_b.wg_set_port(port_b).await, "errno=0\n\n");
+        assert_eq!(wg_b.wg_set_key(key_b).await, "errno=0\n\n");
+
+        // Add peers via UAPI with persistent_keepalive=1 to trigger handshake
+        let endpoint_b = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port_b);
+        assert_eq!(
+            wg_a.wg_set(&format!(
+                "public_key={}\nendpoint={endpoint_b}\nallowed_ip={addr_b}/32\npersistent_keepalive_interval=1",
+                encode(pub_b.as_bytes()),
+            ))
+            .await,
+            "errno=0\n\n"
+        );
+
+        let endpoint_a = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port_a);
+        assert_eq!(
+            wg_b.wg_set(&format!(
+                "public_key={}\nendpoint={endpoint_a}\nallowed_ip={addr_a}/32\npersistent_keepalive_interval=1",
+                encode(pub_a.as_bytes()),
+            ))
+            .await,
+            "errno=0\n\n"
+        );
+
+        // Wait for persistent_keepalive to trigger AWG handshake over UDP
+        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+
+        // Verify AWG handshake completed: check last_handshake_time is set and
+        // at least one side sent data packets (keepalives).
+        // The handshake succeeding proves both sides can encode/decode AWG-obfuscated
+        // HandshakeInit (h1/s1/junk) and HandshakeResp (h2/s2) messages.
+        let get_a = wg_a.wg_get().await;
+        assert!(
+            get_a.contains("last_handshake_time_sec=")
+                && !get_a.contains("last_handshake_time_sec=0\n"),
+            "AWG handshake never completed on device A: {get_a}"
+        );
+        assert!(
+            !get_a.contains("tx_bytes=0"),
+            "Device A sent no data after AWG handshake: {get_a}"
+        );
+
+        let get_b = wg_b.wg_get().await;
+        assert!(
+            get_b.contains("last_handshake_time_sec=")
+                && !get_b.contains("last_handshake_time_sec=0\n"),
+            "AWG handshake never completed on device B: {get_b}"
+        );
     }
 }

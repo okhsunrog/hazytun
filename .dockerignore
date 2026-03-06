@@ -1,0 +1,9 @@
+target
+.git
+.github
+.vscode
+.idea
+.helix
+.zed
+.local
+result
