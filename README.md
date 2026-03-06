@@ -1,6 +1,39 @@
 # GotaTun
 
-A userspace [WireGuard<sup>®</sup>](https://www.wireguard.com/) implementation, and a fork of [BoringTun](https://github.com/cloudflare/boringtun).
+A userspace [WireGuard<sup>®</sup>](https://www.wireguard.com/) implementation with [AmneziaWG](https://docs.amnezia.org/documentation/amnezia-wg/) obfuscation support.
+
+Fork of [Mullvad's GotaTun](https://github.com/mullvad/gotatun), which is itself a fork of [BoringTun](https://github.com/cloudflare/boringtun).
+
+## AmneziaWG
+
+GotaTun supports AmneziaWG protocol obfuscation to evade deep packet inspection (DPI). When enabled, WireGuard packets are modified so they no longer match known WireGuard traffic signatures. Both sides of a tunnel must use identical AWG settings.
+
+AWG parameters are passed via CLI flags or environment variables:
+
+| Flag | Env var | Description |
+|------|---------|-------------|
+| `--awg-h1` | `AWG_H1` | Header for HandshakeInit (value or `min-max` range) |
+| `--awg-h2` | `AWG_H2` | Header for HandshakeResp |
+| `--awg-h3` | `AWG_H3` | Header for CookieReply |
+| `--awg-h4` | `AWG_H4` | Header for Data |
+| `--awg-s1` | `AWG_S1` | Padding bytes prepended to HandshakeInit |
+| `--awg-s2` | `AWG_S2` | Padding bytes prepended to HandshakeResp |
+| `--awg-s3` | `AWG_S3` | Padding bytes prepended to CookieReply |
+| `--awg-s4` | `AWG_S4` | Padding bytes prepended to Data |
+| `--awg-jc` | `AWG_JC` | Number of junk packets before handshake |
+| `--awg-jmin` | `AWG_JMIN` | Minimum junk packet size (bytes) |
+| `--awg-jmax` | `AWG_JMAX` | Maximum junk packet size (bytes) |
+
+Example:
+
+```sh
+gotatun -f utun0 \
+  --awg-h1 1000-1100 --awg-h2 2000-2100 --awg-h3 3000-3100 --awg-h4 4000-4100 \
+  --awg-s1 32 --awg-s2 32 \
+  --awg-jc 3 --awg-jmin 50 --awg-jmax 150
+```
+
+With no AWG flags, behavior is identical to standard WireGuard.
 
 ## License
 
@@ -41,10 +74,20 @@ It is also possible to use with [wg-quick](https://git.zx2c4.com/WireGuard/about
 
 ## Testing
 
-Testing this project has a few requirements:
+Unit tests run without special privileges:
 
-- `sudo`: required to create tunnels. When you run `cargo test` you'll be prompted for your password.
-- Docker: you can install it [here](https://www.docker.com/get-started). If you are on Ubuntu/Debian you can run `apt-get install docker.io`.
+```sh
+cargo test
+```
+
+End-to-end tests run inside an isolated Docker container (requires Docker):
+
+```sh
+./run-e2e-tests.sh                        # run all e2e tests
+./run-e2e-tests.sh test_wg_start_ipv4     # run a specific test
+```
+
+The e2e tests create real TUN interfaces and WireGuard tunnels, verifying both standard WireGuard and AmneziaWG obfuscation.
 
 ## Supported platforms
 
