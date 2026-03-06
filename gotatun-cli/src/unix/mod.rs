@@ -15,6 +15,7 @@ use daemonize::Daemonize;
 use eyre::{Context, Result, bail};
 use gotatun::device::uapi::UapiServer;
 use gotatun::device::{DefaultDeviceTransports, Device, DeviceBuilder};
+use gotatun::noise::awg::{AwgConfig, MagicHeader};
 use gotatun::tun::tun_async_device::TunDevice;
 use std::fs::File;
 use std::future::Future;
@@ -58,6 +59,51 @@ struct Args {
     #[cfg(target_os = "macos")]
     #[clap(long, env = "WG_TUN_NAME_FILE")]
     tun_name_file: Option<String>,
+
+    // AmneziaWG obfuscation parameters
+    /// AWG header for HandshakeInit (single value or "min-max" range)
+    #[clap(long, env = "AWG_H1")]
+    awg_h1: Option<String>,
+
+    /// AWG header for HandshakeResp (single value or "min-max" range)
+    #[clap(long, env = "AWG_H2")]
+    awg_h2: Option<String>,
+
+    /// AWG header for CookieReply (single value or "min-max" range)
+    #[clap(long, env = "AWG_H3")]
+    awg_h3: Option<String>,
+
+    /// AWG header for Data (single value or "min-max" range)
+    #[clap(long, env = "AWG_H4")]
+    awg_h4: Option<String>,
+
+    /// Random padding bytes prepended to HandshakeInit
+    #[clap(long, env = "AWG_S1")]
+    awg_s1: Option<usize>,
+
+    /// Random padding bytes prepended to HandshakeResp
+    #[clap(long, env = "AWG_S2")]
+    awg_s2: Option<usize>,
+
+    /// Random padding bytes prepended to CookieReply
+    #[clap(long, env = "AWG_S3")]
+    awg_s3: Option<usize>,
+
+    /// Random padding bytes prepended to Data
+    #[clap(long, env = "AWG_S4")]
+    awg_s4: Option<usize>,
+
+    /// Number of junk packets sent before handshake initiation
+    #[clap(long, env = "AWG_JC")]
+    awg_jc: Option<usize>,
+
+    /// Minimum junk packet size in bytes
+    #[clap(long, env = "AWG_JMIN")]
+    awg_jmin: Option<usize>,
+
+    /// Maximum junk packet size in bytes
+    #[clap(long, env = "AWG_JMAX")]
+    awg_jmax: Option<usize>,
 }
 
 pub fn main() {
@@ -186,6 +232,47 @@ async fn wait_for_shutdown(device: Device<DefaultDeviceTransports>) {
     device.stop().await;
 }
 
+fn parse_awg_config(args: &Args) -> eyre::Result<AwgConfig> {
+    let mut awg = AwgConfig::default();
+
+    if let Some(ref s) = args.awg_h1 {
+        awg.h1 = MagicHeader::parse(s).context("Invalid --awg-h1")?;
+    }
+    if let Some(ref s) = args.awg_h2 {
+        awg.h2 = MagicHeader::parse(s).context("Invalid --awg-h2")?;
+    }
+    if let Some(ref s) = args.awg_h3 {
+        awg.h3 = MagicHeader::parse(s).context("Invalid --awg-h3")?;
+    }
+    if let Some(ref s) = args.awg_h4 {
+        awg.h4 = MagicHeader::parse(s).context("Invalid --awg-h4")?;
+    }
+    if let Some(v) = args.awg_s1 {
+        awg.s1 = v;
+    }
+    if let Some(v) = args.awg_s2 {
+        awg.s2 = v;
+    }
+    if let Some(v) = args.awg_s3 {
+        awg.s3 = v;
+    }
+    if let Some(v) = args.awg_s4 {
+        awg.s4 = v;
+    }
+    if let Some(v) = args.awg_jc {
+        awg.jc = v;
+    }
+    if let Some(v) = args.awg_jmin {
+        awg.jmin = v;
+    }
+    if let Some(v) = args.awg_jmax {
+        awg.jmax = v;
+    }
+
+    awg.validate().context("Invalid AWG configuration")?;
+    Ok(awg)
+}
+
 /// Create and configure wireguard tunnel
 async fn setup_device(args: Args) -> eyre::Result<Device<DefaultDeviceTransports>> {
     let (socket_uid, socket_gid) = (!args.disable_drop_privileges)
@@ -207,6 +294,11 @@ async fn setup_device(args: Args) -> eyre::Result<Device<DefaultDeviceTransports
             .context("Failed to write to tun-name-file")?;
     }
 
+    let awg = parse_awg_config(&args)?;
+    if !awg.is_standard_wg() {
+        info!("AmneziaWG obfuscation enabled");
+    }
+
     let uapi = UapiServer::default_unix_socket(&tun_name, socket_uid, socket_gid)
         .context("Failed to create UAPI unix socket")?;
 
@@ -214,6 +306,7 @@ async fn setup_device(args: Args) -> eyre::Result<Device<DefaultDeviceTransports
         .with_uapi(uapi)
         .with_default_udp()
         .with_ip(tun)
+        .with_awg(awg)
         .build()
         .await
         .context("Failed to start WireGuard device")?;
