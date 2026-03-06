@@ -17,6 +17,7 @@ use rand::{SeedableRng, rngs::StdRng};
 use tokio::{join, select, time::sleep};
 use zerocopy::IntoBytes;
 
+use crate::noise::awg::{AwgConfig, MagicHeader};
 use crate::noise::index_table::IndexTable;
 
 pub mod mock;
@@ -182,6 +183,97 @@ async fn test_endpoint_roaming() {
 /// The number of packets we send through the tunnel
 fn packet_count() -> usize {
     mock::packets_of_every_size().len()
+}
+
+/// Test that packets flow correctly with AWG obfuscation enabled.
+#[tokio::test]
+#[test_log::test]
+async fn awg_data_flow() {
+    let awg = AwgConfig {
+        h1: MagicHeader::range(1000, 1100),
+        h2: MagicHeader::range(2000, 2100),
+        h3: MagicHeader::range(3000, 3100),
+        h4: MagicHeader::range(4000, 4100),
+        s1: 32,
+        s2: 16,
+        s3: 8,
+        s4: 4,
+        jc: 3,
+        jmin: 50,
+        jmax: 150,
+    };
+    assert!(awg.validate().is_ok());
+
+    let (alice, mut bob, _eve) = mock::device_pair_with_awg(awg).await;
+    let packet = mock::packet(b"Hello AWG!");
+
+    let drive = async move {
+        alice.app_tx.send(packet.clone()).await;
+        let received = bob.app_rx.recv().await;
+        assert_eq!(received.as_bytes(), packet.as_bytes());
+
+        drop((alice, bob));
+    };
+
+    select! {
+        _ = drive => {},
+        _ = sleep(Duration::from_secs(5)) => panic!("awg_data_flow timeout"),
+    }
+}
+
+/// Test that AWG obfuscation changes wire-level packet headers.
+#[tokio::test]
+#[test_log::test]
+async fn awg_wire_format_obfuscated() {
+    let awg = AwgConfig {
+        h1: MagicHeader::range(1000, 1100),
+        h2: MagicHeader::range(2000, 2100),
+        h3: MagicHeader::range(3000, 3100),
+        h4: MagicHeader::range(4000, 4100),
+        s1: 32,
+        s2: 16,
+        s3: 0,
+        s4: 8,
+        jc: 0,
+        jmin: 0,
+        jmax: 0,
+    };
+
+    let (alice, mut bob, eve) = mock::device_pair_with_awg(awg.clone()).await;
+    let packet = mock::packet(b"Hello obfuscated!");
+
+    let eavesdrop = async {
+        // Collect all UDP payloads and verify they don't have standard WG headers
+        let mut udp_stream = std::pin::pin!(eve.udp());
+        let mut seen_any = false;
+        while let Some(udp_pkt) = udp_stream.next().await {
+            let payload = udp_pkt.as_bytes();
+            if payload.len() >= 4 {
+                let header = u32::from_le_bytes(payload[..4].try_into().unwrap());
+                // Standard WG uses types 1-4 in the first byte (with 3 zero reserved bytes)
+                // AWG headers should be in our custom ranges
+                assert!(
+                    header > 4,
+                    "expected obfuscated header, got standard WG header: {header}"
+                );
+                seen_any = true;
+            }
+        }
+        assert!(seen_any, "expected to see some packets on the wire");
+    };
+
+    let drive = async move {
+        alice.app_tx.send(packet.clone()).await;
+        let received = bob.app_rx.recv().await;
+        assert_eq!(received.as_bytes(), packet.as_bytes());
+        drop((alice, bob));
+    };
+
+    let combined = async { tokio::join!(drive, eavesdrop) };
+    select! {
+        _ = combined => {},
+        _ = sleep(Duration::from_secs(5)) => panic!("awg_wire_format_obfuscated timeout"),
+    }
 }
 
 /// Helper method to test that packets can be sent from one [`Device`] to another.

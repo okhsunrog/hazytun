@@ -30,7 +30,7 @@ use zerocopy::IntoBytes;
 
 use crate::{
     device::{Device, DeviceBuilder, Peer},
-    noise::index_table::IndexTable,
+    noise::{awg::AwgConfig, index_table::IndexTable},
     packet::{
         Ip, IpNextProtocol, Ipv4, Ipv4Header, Ipv6, Packet, PacketBufPool, Udp, WgData,
         WgHandshakeInit, WgHandshakeResp, WgKind,
@@ -48,6 +48,10 @@ pub const BOB_INDEX_SEED: u64 = 2;
 pub const TUN_MTU: u16 = 1360;
 
 pub async fn device_pair() -> (MockDevice, MockDevice, MockEavesdropper) {
+    device_pair_with_awg(AwgConfig::default()).await
+}
+
+pub async fn device_pair_with_awg(awg: AwgConfig) -> (MockDevice, MockDevice, MockEavesdropper) {
     let (mock_tun_a, mock_app_tx_a, mock_app_rx_a) = mock_tun();
     let (mock_tun_b, mock_app_tx_b, mock_app_rx_b) = mock_tun();
 
@@ -147,6 +151,7 @@ pub async fn device_pair() -> (MockDevice, MockDevice, MockEavesdropper) {
         .with_index_table(IndexTable::from_rng(StdRng::seed_from_u64(
             ALICE_INDEX_SEED,
         )))
+        .with_awg(awg.clone())
         .build()
         .await
         .expect("create mock device");
@@ -158,6 +163,7 @@ pub async fn device_pair() -> (MockDevice, MockDevice, MockEavesdropper) {
         .with_listen_port(port) // TODO: is this necessary?
         .with_peer(peer_a)
         .with_index_table(IndexTable::from_rng(StdRng::seed_from_u64(BOB_INDEX_SEED)))
+        .with_awg(awg)
         .build()
         .await
         .expect("create mock device");
