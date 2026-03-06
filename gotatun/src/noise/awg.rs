@@ -11,8 +11,11 @@
 //!
 //! With default configuration, behavior is identical to standard WireGuard.
 
+use bytes::BytesMut;
 use rand::Rng;
 use std::fmt;
+
+use crate::packet::Packet;
 
 /// Header type range for a WireGuard message type.
 ///
@@ -180,6 +183,28 @@ impl AwgConfig {
         }
 
         Ok(())
+    }
+
+    /// Generate junk packets to send before a handshake initiation.
+    ///
+    /// Returns an empty Vec if `jc == 0`.
+    pub fn generate_junk_packets(&self) -> Vec<Packet> {
+        if self.jc == 0 || self.jmax == 0 {
+            return Vec::new();
+        }
+        let mut rng = rand::rng();
+        (0..self.jc)
+            .map(|_| {
+                let size = if self.jmin == self.jmax {
+                    self.jmin
+                } else {
+                    rng.random_range(self.jmin..=self.jmax)
+                };
+                let mut buf = BytesMut::zeroed(size);
+                rng.fill(&mut buf[..]);
+                Packet::from_bytes(buf)
+            })
+            .collect()
     }
 }
 

@@ -109,6 +109,20 @@ impl WgKind {
         let packet: Packet = self.into();
         packet.prepend_random(padding)
     }
+
+    /// Convert to all packets that should be sent over UDP.
+    ///
+    /// For HandshakeInit: generates junk packets (if configured) followed by the padded packet.
+    /// For all other types: returns just the padded packet.
+    pub fn into_send_packets(self, awg: &AwgConfig) -> impl Iterator<Item = Packet> {
+        let junk = if matches!(self, WgKind::HandshakeInit(_)) {
+            awg.generate_junk_packets()
+        } else {
+            Vec::new()
+        };
+        let actual = self.into_packet_with_padding(awg);
+        junk.into_iter().chain(std::iter::once(actual))
+    }
 }
 
 /// The first byte of a WireGuard packet. This identifies its type.
