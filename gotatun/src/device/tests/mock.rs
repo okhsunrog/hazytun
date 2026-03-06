@@ -275,8 +275,11 @@ impl MockEavesdropper {
 
     /// Get as stream of all sniffed WireGuard packets. [Read more](Self::ip)
     pub fn wg(&self) -> impl Stream<Item = WgKind> + use<> {
-        self.udp()
-            .map(|udp| udp.into_payload().try_into_wg().unwrap())
+        self.udp().map(|udp| {
+            udp.into_payload()
+                .try_into_wg(&crate::noise::awg::AwgConfig::default())
+                .unwrap()
+        })
     }
 
     /// Get as stream of all sniffed [`WgData`] packets. [Read more](Self::ip)

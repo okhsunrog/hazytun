@@ -14,9 +14,10 @@ use std::fmt::{self, Debug};
 use std::mem::offset_of;
 use std::ops::Deref;
 
-use eyre::{bail, eyre};
+use eyre::bail;
 use zerocopy::{FromBytes, FromZeros, Immutable, IntoBytes, KnownLayout, Unaligned, little_endian};
 
+use crate::noise::awg::AwgConfig;
 use crate::packet::util::size_must_be;
 use crate::packet::{CheckedPayload, Packet};
 
@@ -93,6 +94,20 @@ impl From<WgKind> for Packet {
             WgKind::CookieReply(packet) => packet.into(),
             WgKind::Data(packet) => packet.into(),
         }
+    }
+}
+
+impl WgKind {
+    /// Convert to an untyped [`Packet`], prepending AWG padding if configured.
+    pub fn into_packet_with_padding(self, awg: &AwgConfig) -> Packet {
+        let padding = match &self {
+            WgKind::HandshakeInit(_) => awg.s1,
+            WgKind::HandshakeResp(_) => awg.s2,
+            WgKind::CookieReply(_) => awg.s3,
+            WgKind::Data(_) => awg.s4,
+        };
+        let packet: Packet = self.into();
+        packet.prepend_random(padding)
     }
 }
 
@@ -503,23 +518,60 @@ impl Default for WgCookieReply {
 
 impl Packet {
     /// Try to cast to a WireGuard packet while sanity-checking packet type and size.
-    pub fn try_into_wg(self) -> eyre::Result<WgKind> {
-        let wg = Wg::ref_from_bytes(self.as_bytes())
-            .map_err(|_| eyre!("Not a wireguard packet, too small."))?;
-
-        let len = wg.as_bytes().len();
-        match (wg.packet_type, len) {
-            (WgPacketType::HandshakeInit, WgHandshakeInit::LEN) => {
-                Ok(WgKind::HandshakeInit(self.cast()))
-            }
-            (WgPacketType::HandshakeResp, WgHandshakeResp::LEN) => {
-                Ok(WgKind::HandshakeResp(self.cast()))
-            }
-            (WgPacketType::CookieReply, WgCookieReply::LEN) => Ok(WgKind::CookieReply(self.cast())),
-            (WgPacketType::Data, WgData::OVERHEAD..) => Ok(WgKind::Data(self.cast())),
-            _ => bail!("Not a wireguard packet, bad type/size."),
+    ///
+    /// Uses AmneziaWG configuration to validate header type ranges and strip padding.
+    /// With default `AwgConfig`, this behaves identically to standard WireGuard.
+    pub fn try_into_wg(self, awg: &AwgConfig) -> eyre::Result<WgKind> {
+        if self.as_bytes().len() < 4 {
+            bail!("Not a wireguard packet, too small.");
         }
+
+        let len = self.as_bytes().len();
+
+        // Try each message type with size and header validation.
+        // For AWG: header is at padding offset, total size includes padding.
+        if len == awg.s1 + WgHandshakeInit::LEN && awg.h1.validate(header_at(&self, awg.s1)) {
+            if awg.s1 > 0 {
+                return Ok(WgKind::HandshakeInit(self.slice_from(awg.s1).cast()));
+            }
+            return Ok(WgKind::HandshakeInit(self.cast()));
+        }
+
+        if len == awg.s2 + WgHandshakeResp::LEN && awg.h2.validate(header_at(&self, awg.s2)) {
+            if awg.s2 > 0 {
+                return Ok(WgKind::HandshakeResp(self.slice_from(awg.s2).cast()));
+            }
+            return Ok(WgKind::HandshakeResp(self.cast()));
+        }
+
+        if len == awg.s3 + WgCookieReply::LEN && awg.h3.validate(header_at(&self, awg.s3)) {
+            if awg.s3 > 0 {
+                return Ok(WgKind::CookieReply(self.slice_from(awg.s3).cast()));
+            }
+            return Ok(WgKind::CookieReply(self.cast()));
+        }
+
+        if len >= awg.s4 + WgData::OVERHEAD && awg.h4.validate(header_at(&self, awg.s4)) {
+            if awg.s4 > 0 {
+                return Ok(WgKind::Data(self.slice_from(awg.s4).cast()));
+            }
+            return Ok(WgKind::Data(self.cast()));
+        }
+
+        bail!("Not a wireguard packet, bad type/size.");
     }
+}
+
+/// Read the header type (first 4 bytes as LE u32) at a given padding offset.
+fn header_at(packet: &Packet, offset: usize) -> u32 {
+    if packet.as_bytes().len() < offset + 4 {
+        return 0;
+    }
+    u32::from_le_bytes(
+        packet.as_bytes()[offset..offset + 4]
+            .try_into()
+            .unwrap_or_default(),
+    )
 }
 
 impl Debug for WgPacketType {
