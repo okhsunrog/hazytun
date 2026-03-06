@@ -12,6 +12,8 @@
 
 //! Noise protocol implementation for WireGuard cryptographic handshakes and sessions.
 
+/// AmneziaWG obfuscation configuration.
+pub mod awg;
 /// Error types for WireGuard protocol operations.
 pub mod errors;
 /// WireGuard handshake implementation using the Noise protocol.
