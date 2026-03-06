@@ -11,6 +11,7 @@
 // SPDX-License-Identifier: MPL-2.0
 
 use crate::{
+    noise::awg::AwgConfig,
     noise::errors::WireGuardError,
     noise::index_table::Index,
     packet::{Packet, WgData, WgDataHeader, WgKind},
@@ -235,7 +236,10 @@ impl Session {
         data.tag_mut().copy_from_slice(tag.as_ref());
 
         // this won't panic since we've correctly initialized a WgData packet
-        let packet = buf.try_into_wg().expect("is a wireguard packet");
+        // Use default AWG config since the packet was just constructed with standard type bytes
+        let packet = buf
+            .try_into_wg(&AwgConfig::default())
+            .expect("is a wireguard packet");
         let WgKind::Data(packet) = packet else {
             unreachable!("is a wireguard data packet");
         };

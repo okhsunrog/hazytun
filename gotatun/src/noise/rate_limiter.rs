@@ -11,6 +11,7 @@
 // SPDX-License-Identifier: MPL-2.0
 
 use super::handshake::{b2s_hash, b2s_keyed_mac_16, b2s_keyed_mac_16_2, b2s_mac_24};
+use crate::noise::awg::AwgConfig;
 use crate::noise::handshake::{LABEL_COOKIE, LABEL_MAC1};
 use crate::noise::{TunnResult, WireGuardError};
 use crate::packet::{Packet, WgCookieReply, WgHandshakeBase, WgKind};
@@ -175,9 +176,14 @@ impl RateLimiter {
 
     /// Decode the packet as wireguard packet.
     /// Then, verify the MAC fields on the packet (if any), and apply rate limiting if needed.
-    pub fn verify_packet(&self, src_addr: IpAddr, packet: Packet) -> Result<WgKind, TunnResult> {
+    pub fn verify_packet(
+        &self,
+        src_addr: IpAddr,
+        packet: Packet,
+        awg: &AwgConfig,
+    ) -> Result<WgKind, TunnResult> {
         let packet = packet
-            .try_into_wg()
+            .try_into_wg(awg)
             .map_err(|_err| TunnResult::Err(WireGuardError::InvalidPacket))?;
 
         // Verify and rate limit handshake messages only

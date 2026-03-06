@@ -28,11 +28,13 @@ mod timers;
 
 use zerocopy::IntoBytes;
 
+use crate::noise::awg::AwgConfig;
 use crate::noise::errors::WireGuardError;
 use crate::noise::handshake::Handshake;
 use crate::noise::index_table::IndexTable;
 use crate::noise::rate_limiter::RateLimiter;
 use crate::noise::timers::{TimerName, Timers};
+use crate::packet::CheckedPayload;
 use crate::packet::{Packet, WgCookieReply, WgData, WgHandshakeInit, WgHandshakeResp, WgKind};
 use crate::tun::MtuWatcher;
 use crate::x25519;
@@ -83,6 +85,8 @@ pub struct Tunn {
     tx_bytes: usize,
     rx_bytes: usize,
     rate_limiter: Arc<RateLimiter>,
+    /// AmneziaWG obfuscation configuration.
+    awg: AwgConfig,
 }
 
 impl Tunn {
@@ -99,6 +103,7 @@ impl Tunn {
         persistent_keepalive: Option<u16>,
         index_table: IndexTable,
         rate_limiter: Arc<RateLimiter>,
+        awg: AwgConfig,
     ) -> Self {
         let static_public = x25519::PublicKey::from(&static_private);
 
@@ -120,7 +125,18 @@ impl Tunn {
             timers: Timers::new(persistent_keepalive),
 
             rate_limiter,
+            awg,
         }
+    }
+
+    /// Get a reference to the AWG configuration.
+    pub fn awg_config(&self) -> &AwgConfig {
+        &self.awg
+    }
+
+    /// Apply AWG header type to an outgoing packet by overwriting the first 4 bytes.
+    fn apply_awg_header<T: CheckedPayload + ?Sized>(&self, packet: &mut Packet<T>, header: u32) {
+        packet.buf_mut()[..4].copy_from_slice(&header.to_le_bytes());
     }
 
     /// Update the private key and clear existing sessions.
@@ -173,7 +189,8 @@ impl Tunn {
         let current = self.current;
         if let Some(ref session) = self.sessions[current % N_SESSIONS] {
             // Send the packet using an established session
-            let packet = session.format_packet_data(packet);
+            let mut packet = session.format_packet_data(packet);
+            self.apply_awg_header(&mut packet, self.awg.h4.generate());
             self.timer_tick(TimerName::TimeLastPacketSent);
             // Exclude Keepalive packets from timer update.
             if !packet.is_keepalive() {
@@ -205,7 +222,8 @@ impl Tunn {
     ) -> Result<TunnResult, WireGuardError> {
         log::debug!("Received handshake_initiation: {}", p.sender_idx);
 
-        let (packet, session) = self.handshake.receive_handshake_initialization(p)?;
+        let (mut packet, session) = self.handshake.receive_handshake_initialization(p)?;
+        self.apply_awg_header(&mut packet, self.awg.h2.generate());
 
         // Store new session in next slot
         let slot = self.next_session_slot();
@@ -235,7 +253,8 @@ impl Tunn {
         let mut p = p.into_bytes();
         p.truncate(0);
 
-        let keepalive_packet = session.format_packet_data(p);
+        let mut keepalive_packet = session.format_packet_data(p);
+        self.apply_awg_header(&mut keepalive_packet, self.awg.h4.generate());
         // Store new session in next slot
         let slot = self.next_session_slot();
         self.put_session(slot, session);
@@ -352,7 +371,8 @@ impl Tunn {
 
         let starting_new_handshake = !self.handshake.is_in_progress();
 
-        let packet = self.handshake.format_handshake_initiation();
+        let mut packet = self.handshake.format_handshake_initiation();
+        self.apply_awg_header(&mut packet, self.awg.h1.generate());
         log::debug!("Sending handshake_initiation");
 
         if starting_new_handshake {
@@ -498,6 +518,7 @@ mod tests {
             None,
             IndexTable::from_os_rng(),
             rate_limiter,
+            AwgConfig::default(),
         );
 
         let rate_limiter = Arc::new(RateLimiter::new(&their_public_key, HANDSHAKE_RATE_LIMIT));
@@ -508,6 +529,7 @@ mod tests {
             None,
             IndexTable::from_os_rng(),
             rate_limiter,
+            AwgConfig::default(),
         );
 
         (my_tun, their_tun)

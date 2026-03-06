@@ -63,6 +63,7 @@ use bytes::{Buf, BytesMut};
 use duplicate::duplicate_item;
 use either::Either;
 use eyre::{Context, bail, eyre};
+use rand::Rng;
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout, Unaligned};
 
 mod ip;
@@ -260,6 +261,24 @@ impl Packet<[u8]> {
     /// See [`BytesMut::truncate`].
     pub fn truncate(&mut self, new_len: usize) {
         self.inner.buf.truncate(new_len);
+    }
+
+    /// Strip the first `n` bytes from the packet (e.g., AWG padding bytes).
+    pub fn slice_from(mut self, n: usize) -> Packet {
+        self.inner.buf.advance(n);
+        self.cast()
+    }
+
+    /// Prepend `n` random bytes to this packet (AWG padding).
+    pub fn prepend_random(self, n: usize) -> Packet {
+        if n == 0 {
+            return self;
+        }
+        let mut buf = BytesMut::with_capacity(n + self.inner.buf.len());
+        buf.resize(n, 0);
+        rand::rng().fill(&mut buf[..n]);
+        buf.extend_from_slice(&self.inner.buf);
+        Packet::from_bytes(buf)
     }
 
     /// Try to cast this untyped packet into an [`Ip`].
