@@ -125,6 +125,10 @@ impl PeerState {
         self.tunnel.time_since_last_handshake()
     }
 
+    pub fn time_since_last_packet_received(&self) -> Option<std::time::Duration> {
+        self.tunnel.time_since_last_packet_received()
+    }
+
     pub fn persistent_keepalive(&self) -> Option<u16> {
         self.tunnel.persistent_keepalive()
     }

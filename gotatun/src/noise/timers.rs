@@ -348,6 +348,20 @@ impl Tunn {
         }
     }
 
+    /// Get the time elapsed since the last authenticated packet was received.
+    ///
+    /// Returns `None` if no session has been established.
+    pub fn time_since_last_packet_received(&self) -> Option<Duration> {
+        let current_session = self.current;
+        if self.sessions[current_session % super::N_SESSIONS].is_some() {
+            let now = self.timers.now();
+            let last = self.timers[TimeLastPacketReceived];
+            Some(now.saturating_sub(last))
+        } else {
+            None
+        }
+    }
+
     /// Get the persistent keepalive interval in seconds.
     ///
     /// Returns `None` if persistent keepalive is disabled (set to 0).
