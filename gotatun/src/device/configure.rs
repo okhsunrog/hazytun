@@ -30,6 +30,8 @@ pub struct DeviceRead<'a, T: DeviceTransports> {
 pub struct Stats {
     /// Time elapsed since the last successful handshake with this peer.
     pub last_handshake: Option<Duration>,
+    /// Time elapsed since the last authenticated packet was received from this peer.
+    pub last_packet_received: Option<Duration>,
     /// Total number of bytes received from this peer.
     pub rx_bytes: usize,
     /// Total number of bytes sent to this peer.
@@ -174,10 +176,12 @@ impl<T: DeviceTransports> DeviceRead<'_, T> {
 
             let (_, tx_bytes, rx_bytes, ..) = p.tunnel.stats();
             let last_handshake = p.time_since_last_handshake();
+            let last_packet_received = p.time_since_last_packet_received();
             let stats = Stats {
                 tx_bytes,
                 rx_bytes,
                 last_handshake,
+                last_packet_received,
                 #[cfg(feature = "daita")]
                 daita: daita_stats,
             };
