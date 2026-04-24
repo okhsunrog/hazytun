@@ -901,8 +901,8 @@ mod tests {
 
         let port_a = next_port();
         let port_b = next_port();
-        let key_a = StaticSecret::random_from_rng(OsRng);
-        let key_b = StaticSecret::random_from_rng(OsRng);
+        let key_a = StaticSecret::random_from_rng(rand_core::OsRng);
+        let key_b = StaticSecret::random_from_rng(rand_core::OsRng);
         let pub_a = PublicKey::from(&key_a);
         let pub_b = PublicKey::from(&key_b);
 
