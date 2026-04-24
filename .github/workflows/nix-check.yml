@@ -5,6 +5,11 @@ on:
     paths:
       - .github/workflows/nix-check.yml
       - '**/*.nix'
+  push:
+    branches: [amnezia]
+    paths:
+      - .github/workflows/nix-check.yml
+      - '**/*.nix'
   workflow_dispatch:
 
 permissions: {}

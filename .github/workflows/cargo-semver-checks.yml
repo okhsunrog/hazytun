@@ -2,6 +2,8 @@
 name: Check semver compatibility
 on:
   pull_request:
+  push:
+    branches: [amnezia]
   workflow_dispatch:
 
 permissions: {}

@@ -5,6 +5,11 @@ on:
     paths:
       - .github/workflows/license.yml
       - "**/*.rs"
+  push:
+    branches: [amnezia]
+    paths:
+      - .github/workflows/license.yml
+      - "**/*.rs"
   workflow_dispatch:
 
 permissions: {}

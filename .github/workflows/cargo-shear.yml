@@ -6,6 +6,12 @@ on:
       - .github/workflows/cargo-shear.yml
       - "**/*.rs"
       - "**/Cargo.toml"
+  push:
+    branches: [amnezia]
+    paths:
+      - .github/workflows/cargo-shear.yml
+      - "**/*.rs"
+      - "**/Cargo.toml"
   workflow_dispatch:
 
 permissions: {}

@@ -2,6 +2,9 @@ name: cargo-doc
 
 on:
   pull_request:
+  push:
+    branches: [amnezia]
+  workflow_dispatch:
 
 env:
   CARGO_TERM_COLOR: always
