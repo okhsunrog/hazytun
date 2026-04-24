@@ -17,7 +17,7 @@ use rand::{SeedableRng, rngs::StdRng};
 use tokio::{join, select, time::sleep};
 use zerocopy::IntoBytes;
 
-use crate::noise::awg::{AwgConfig, MagicHeader};
+use crate::noise::awg::{AwgConfig, MagicHeader, ObfChain};
 use crate::noise::index_table::IndexTable;
 
 pub mod mock;
@@ -275,6 +275,138 @@ async fn awg_wire_format_obfuscated() {
     select! {
         _ = combined => {},
         _ = sleep(Duration::from_secs(5)) => panic!("awg_wire_format_obfuscated timeout"),
+    }
+}
+
+/// Smoke test: I1..I5 custom signature packets do not break the handshake.
+///
+/// Uses a non-trivial mix of DSL tags across slots (with gaps) plus junk
+/// packets and headers/padding. End-to-end data flow must still complete.
+#[tokio::test]
+#[test_log::test]
+async fn awg_i_packets_dataflow() {
+    let mut awg = AwgConfig {
+        h1: MagicHeader::range(1000, 1100),
+        h2: MagicHeader::range(2000, 2100),
+        h3: MagicHeader::range(3000, 3100),
+        h4: MagicHeader::range(4000, 4100),
+        s1: 16,
+        s2: 16,
+        s3: 8,
+        s4: 4,
+        jc: 2,
+        jmin: 30,
+        jmax: 50,
+        i_packets: [const { None }; 5],
+    };
+    awg.i_packets[0] = Some(ObfChain::parse("<b 0x11223344>").unwrap());
+    awg.i_packets[1] = Some(ObfChain::parse("<r 20>").unwrap());
+    // I3 deliberately empty — verifies that None slots are skipped cleanly.
+    awg.i_packets[3] = Some(ObfChain::parse("<rd 12><rc 8>").unwrap());
+    awg.i_packets[4] = Some(ObfChain::parse("<t>").unwrap());
+    assert!(awg.validate().is_ok());
+
+    let (alice, mut bob, _eve) = mock::device_pair_with_awg(awg).await;
+    let packet = mock::packet(b"hello through I-packets");
+
+    let drive = async move {
+        alice.app_tx.send(packet.clone()).await;
+        let received = bob.app_rx.recv().await;
+        assert_eq!(received.as_bytes(), packet.as_bytes());
+        drop((alice, bob));
+    };
+
+    select! {
+        _ = drive => {},
+        _ = sleep(Duration::from_secs(5)) => panic!("awg_i_packets_dataflow timeout"),
+    }
+}
+
+/// Wire-order test: I-packets are sent first, then junk, then the handshake
+/// init. None slots are skipped (I3 here). Static `<b …>` bytes are emitted
+/// verbatim, random tags produce the correct byte count.
+#[tokio::test]
+#[test_log::test]
+async fn awg_i_packets_wire_order() {
+    let mut awg = AwgConfig {
+        h1: MagicHeader::range(1000, 1100),
+        h2: MagicHeader::range(2000, 2100),
+        h3: MagicHeader::range(3000, 3100),
+        h4: MagicHeader::range(4000, 4100),
+        s1: 0,
+        s2: 0,
+        s3: 0,
+        s4: 0,
+        jc: 2,
+        // Fixed-size junk so we can identify them by size exactly.
+        jmin: 40,
+        jmax: 40,
+        i_packets: [const { None }; 5],
+    };
+    // I1 — static bytes (unique, identifiable).
+    awg.i_packets[0] = Some(ObfChain::parse("<b 0xCAFEBABE>").unwrap());
+    // I2 — 16 random bytes.
+    awg.i_packets[1] = Some(ObfChain::parse("<r 16>").unwrap());
+    // I3 intentionally None — must be skipped in the stream.
+    // I4 — 8 digits.
+    awg.i_packets[3] = Some(ObfChain::parse("<rd 8>").unwrap());
+    // I5 — static bytes again.
+    awg.i_packets[4] = Some(ObfChain::parse("<b 0xDEADBEEF>").unwrap());
+    assert!(awg.validate().is_ok());
+
+    let (alice, mut bob, eve) = mock::device_pair_with_awg(awg).await;
+    let packet = mock::packet(b"trigger handshake");
+
+    // Collect the first 7 UDP payloads on the wire (UDP header stripped).
+    // These must come from alice's handshake burst: 4 I-packets
+    // (I1, I2, I4, I5 — I3 skipped), 2 junk, 1 handshake init.
+    let eavesdrop = async {
+        let udp_stream = eve.udp().map(|u| u.into_payload().as_bytes().to_vec());
+        let packets: Vec<Vec<u8>> = udp_stream.take(7).collect().await;
+
+        assert_eq!(
+            packets.len(),
+            7,
+            "expected 7 packets, got {}",
+            packets.len()
+        );
+
+        // I1: static 4 bytes
+        assert_eq!(packets[0], vec![0xCA, 0xFE, 0xBA, 0xBE], "I1 mismatch");
+        // I2: 16 random bytes — only length is deterministic
+        assert_eq!(packets[1].len(), 16, "I2 size");
+        // I4: 8 ASCII digits
+        assert_eq!(packets[2].len(), 8, "I4 size");
+        for b in &packets[2] {
+            assert!(b.is_ascii_digit(), "I4 non-digit byte 0x{b:02x}");
+        }
+        // I5: static 4 bytes
+        assert_eq!(packets[3], vec![0xDE, 0xAD, 0xBE, 0xEF], "I5 mismatch");
+
+        // Junk: two packets of exactly 40 bytes
+        assert_eq!(packets[4].len(), 40, "junk 1 size");
+        assert_eq!(packets[5].len(), 40, "junk 2 size");
+
+        // Handshake init: size = MessageInitiation struct (148 bytes) with
+        // custom header in H1 range [1000..=1100] as LE u32.
+        assert_eq!(packets[6].len(), 148, "init size");
+        let header = u32::from_le_bytes(packets[6][..4].try_into().unwrap());
+        assert!(
+            (1000..=1100).contains(&header),
+            "init header {header} not in H1 range"
+        );
+    };
+
+    let drive = async move {
+        alice.app_tx.send(packet.clone()).await;
+        let _ = bob.app_rx.recv().await;
+        drop((alice, bob));
+    };
+
+    let combined = async { tokio::join!(drive, eavesdrop) };
+    select! {
+        _ = combined => {},
+        _ = sleep(Duration::from_secs(5)) => panic!("awg_i_packets_wire_order timeout"),
     }
 }
 
