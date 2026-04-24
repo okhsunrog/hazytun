@@ -296,8 +296,7 @@ impl ObfTag {
 
     fn render(&self, dst: &mut [u8]) {
         use rand::RngCore;
-        const CHARS52: &[u8; 52] =
-            b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ";
+        const CHARS52: &[u8; 52] = b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ";
         const DIGITS10: &[u8; 10] = b"0123456789";
 
         match self {
