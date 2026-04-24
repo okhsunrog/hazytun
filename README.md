@@ -1,12 +1,14 @@
-# GotaTun
+# GotaTun — AmneziaWG fork
 
-A userspace [WireGuard<sup>®</sup>](https://www.wireguard.com/) implementation with [AmneziaWG](https://docs.amnezia.org/documentation/amnezia-wg/) obfuscation support.
+Fork of [Mullvad's GotaTun](https://github.com/mullvad/gotatun) (a userspace [WireGuard<sup>®</sup>](https://www.wireguard.com/) implementation, itself a fork of [BoringTun](https://github.com/cloudflare/boringtun)) that adds full [AmneziaWG 2.0](https://docs.amnezia.org/documentation/amnezia-wg/) obfuscation support. Byte-level interoperability with the reference [amneziawg-go](https://github.com/amnezia-vpn/amneziawg-go) implementation is verified by dedicated integration tests.
 
-Fork of [Mullvad's GotaTun](https://github.com/mullvad/gotatun), which is itself a fork of [BoringTun](https://github.com/cloudflare/boringtun).
+Upstream GotaTun does **not** implement AmneziaWG; this fork adds it on top. The `amnezia` branch tracks upstream `main` closely and layers AWG-specific changes over it.
 
 ## AmneziaWG
 
-GotaTun supports AmneziaWG protocol obfuscation to evade deep packet inspection (DPI). When enabled, WireGuard packets are modified so they no longer match known WireGuard traffic signatures. Both sides of a tunnel must use identical AWG settings.
+AmneziaWG modifies WireGuard packets so they no longer match known WireGuard traffic signatures, defeating deep packet inspection (DPI). Both sides of a tunnel must use identical AWG settings. With no AWG flags, behaviour is identical to standard WireGuard.
+
+The full 2.0 protocol is implemented: custom message headers (H1–H4), message paddings (S1–S4), junk packets (Jc/Jmin/Jmax), and custom signature packets (I1–I5 with the `<b>`/`<r>`/`<rc>`/`<rd>`/`<t>` DSL).
 
 AWG parameters are passed via CLI flags or environment variables:
 
@@ -23,6 +25,25 @@ AWG parameters are passed via CLI flags or environment variables:
 | `--awg-jc` | `AWG_JC` | Number of junk packets before handshake |
 | `--awg-jmin` | `AWG_JMIN` | Minimum junk packet size (bytes) |
 | `--awg-jmax` | `AWG_JMAX` | Maximum junk packet size (bytes) |
+| `--awg-i1` | `AWG_I1` | Custom signature packet 1 (DSL — see below) |
+| `--awg-i2` | `AWG_I2` | Custom signature packet 2 |
+| `--awg-i3` | `AWG_I3` | Custom signature packet 3 |
+| `--awg-i4` | `AWG_I4` | Custom signature packet 4 |
+| `--awg-i5` | `AWG_I5` | Custom signature packet 5 |
+
+### Custom signature packets (I1–I5)
+
+Up to five custom packets are sent before each handshake initiation — ahead of the junk packets and the actual init. Each spec is a sequence of DSL tags:
+
+| Tag | Produces |
+|------|----------|
+| `<b 0xHEX>` | Literal bytes (hex-decoded; `0x` prefix optional; even length) |
+| `<r N>` | N cryptographically random bytes |
+| `<rc N>` | N random ASCII letters `[a-zA-Z]` |
+| `<rd N>` | N random ASCII digits `[0-9]` |
+| `<t>` | Current Unix timestamp as 4 big-endian bytes |
+
+Tags render in declaration order; any characters outside `<...>` are ignored. Unset slots are skipped on the wire.
 
 Example:
 
@@ -30,10 +51,9 @@ Example:
 gotatun -f utun0 \
   --awg-h1 1000-1100 --awg-h2 2000-2100 --awg-h3 3000-3100 --awg-h4 4000-4100 \
   --awg-s1 32 --awg-s2 32 \
-  --awg-jc 3 --awg-jmin 50 --awg-jmax 150
+  --awg-jc 3 --awg-jmin 50 --awg-jmax 150 \
+  --awg-i1 '<b 0xDEADBEEF><r 16>' --awg-i2 '<rd 10>'
 ```
-
-With no AWG flags, behavior is identical to standard WireGuard.
 
 ## License
 
@@ -83,11 +103,12 @@ cargo test
 End-to-end tests run inside an isolated Docker container (requires Docker):
 
 ```sh
-./run-e2e-tests.sh                        # run all e2e tests
-./run-e2e-tests.sh test_wg_start_ipv4     # run a specific test
+./run-e2e-tests.sh                         # run all e2e tests
+./run-e2e-tests.sh test_wg_start_ipv4      # run a specific test
+./run-e2e-tests.sh interop_amneziawg_go    # only the amneziawg-go interop suite
 ```
 
-The e2e tests create real TUN interfaces and WireGuard tunnels, verifying both standard WireGuard and AmneziaWG obfuscation.
+The e2e tests create real TUN interfaces and WireGuard tunnels, verifying standard WireGuard and AmneziaWG obfuscation. Three additional tests (`interop_amneziawg_go_{baseline,v1,v2}`) spin up our `gotatun` alongside a pinned `amneziawg-go` binary (built into the test image) and verify that a handshake completes between the two across all three obfuscation profiles — this is what guarantees byte-level compatibility with the reference implementation.
 
 ## Supported platforms
 
