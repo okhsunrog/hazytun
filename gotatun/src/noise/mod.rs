@@ -118,6 +118,7 @@ impl Tunn<StdRng> {
 
 impl<R: RngCore + Send> Tunn<R> {
     /// Create a new tunnel using own private key and the peer public key.
+    #[allow(clippy::too_many_arguments)]
     pub fn new_with_rng(
         static_private: x25519::StaticSecret,
         peer_static_public: x25519::PublicKey,

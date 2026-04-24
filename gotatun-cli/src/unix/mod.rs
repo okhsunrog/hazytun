@@ -288,7 +288,7 @@ async fn setup_device(args: Args) -> eyre::Result<Device<DefaultDeviceTransports
 
     // wg-quick uses this to find the interface
     #[cfg(target_os = "macos")]
-    if let Some(tun_name_file) = args.tun_name_file {
+    if let Some(tun_name_file) = &args.tun_name_file {
         tokio::fs::write(tun_name_file, &tun_name)
             .await
             .context("Failed to write to tun-name-file")?;
