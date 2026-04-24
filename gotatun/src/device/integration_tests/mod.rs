@@ -888,6 +888,7 @@ mod tests {
             jc: 3,
             jmin: 50,
             jmax: 150,
+            i_packets: [const { None }; 5],
         }
     }
 

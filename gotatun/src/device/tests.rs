@@ -201,6 +201,7 @@ async fn awg_data_flow() {
         jc: 3,
         jmin: 50,
         jmax: 150,
+        i_packets: [const { None }; 5],
     };
     assert!(awg.validate().is_ok());
 
@@ -237,6 +238,7 @@ async fn awg_wire_format_obfuscated() {
         jc: 0,
         jmin: 0,
         jmax: 0,
+        i_packets: [const { None }; 5],
     };
 
     let (alice, mut bob, eve) = mock::device_pair_with_awg(awg.clone()).await;

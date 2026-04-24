@@ -15,7 +15,7 @@ use daemonize::Daemonize;
 use eyre::{Context, Result, bail};
 use gotatun::device::uapi::UapiServer;
 use gotatun::device::{DefaultDeviceTransports, Device, DeviceBuilder};
-use gotatun::noise::awg::{AwgConfig, MagicHeader};
+use gotatun::noise::awg::{AwgConfig, MagicHeader, ObfChain};
 use gotatun::tun::tun_async_device::TunDevice;
 use std::fs::File;
 use std::future::Future;
@@ -104,6 +104,26 @@ struct Args {
     /// Maximum junk packet size in bytes
     #[clap(long, env = "AWG_JMAX")]
     awg_jmax: Option<usize>,
+
+    /// Custom signature packet I1 (obfuscation DSL, e.g. `<b 0xAABB><r 16>`)
+    #[clap(long, env = "AWG_I1")]
+    awg_i1: Option<String>,
+
+    /// Custom signature packet I2 (obfuscation DSL, see --awg-i1)
+    #[clap(long, env = "AWG_I2")]
+    awg_i2: Option<String>,
+
+    /// Custom signature packet I3 (obfuscation DSL, see --awg-i1)
+    #[clap(long, env = "AWG_I3")]
+    awg_i3: Option<String>,
+
+    /// Custom signature packet I4 (obfuscation DSL, see --awg-i1)
+    #[clap(long, env = "AWG_I4")]
+    awg_i4: Option<String>,
+
+    /// Custom signature packet I5 (obfuscation DSL, see --awg-i1)
+    #[clap(long, env = "AWG_I5")]
+    awg_i5: Option<String>,
 }
 
 pub fn main() {
@@ -267,6 +287,20 @@ fn parse_awg_config(args: &Args) -> eyre::Result<AwgConfig> {
     }
     if let Some(v) = args.awg_jmax {
         awg.jmax = v;
+    }
+
+    let i_specs = [
+        (&args.awg_i1, "--awg-i1"),
+        (&args.awg_i2, "--awg-i2"),
+        (&args.awg_i3, "--awg-i3"),
+        (&args.awg_i4, "--awg-i4"),
+        (&args.awg_i5, "--awg-i5"),
+    ];
+    for (idx, (spec, flag)) in i_specs.iter().enumerate() {
+        if let Some(s) = spec {
+            awg.i_packets[idx] =
+                Some(ObfChain::parse(s).with_context(|| format!("Invalid {flag}"))?);
+        }
     }
 
     awg.validate().context("Invalid AWG configuration")?;

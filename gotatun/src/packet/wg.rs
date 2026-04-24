@@ -113,16 +113,19 @@ impl WgKind {
 
     /// Convert to all packets that should be sent over UDP.
     ///
-    /// For HandshakeInit: generates junk packets (if configured) followed by the padded packet.
+    /// For HandshakeInit: emits I1..I5 custom signature packets, then junk
+    /// packets, then the padded init (order matches `amneziawg-go`).
     /// For all other types: returns just the padded packet.
     pub fn into_send_packets(self, awg: &AwgConfig) -> impl Iterator<Item = Packet> {
-        let junk = if matches!(self, WgKind::HandshakeInit(_)) {
-            awg.generate_junk_packets()
+        let prelude = if matches!(self, WgKind::HandshakeInit(_)) {
+            let mut v = awg.generate_i_packets();
+            v.extend(awg.generate_junk_packets());
+            v
         } else {
             Vec::new()
         };
         let actual = self.into_packet_with_padding(awg);
-        junk.into_iter().chain(std::iter::once(actual))
+        prelude.into_iter().chain(std::iter::once(actual))
     }
 }
 

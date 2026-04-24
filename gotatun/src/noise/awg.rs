@@ -127,6 +127,10 @@ pub struct AwgConfig {
     pub jmin: usize,
     /// Maximum junk packet size in bytes. Default: 0.
     pub jmax: usize,
+
+    /// Custom signature packets (I1..I5) sent before junk packets
+    /// prior to each handshake initiation. `None` entries are skipped.
+    pub i_packets: [Option<ObfChain>; 5],
 }
 
 impl Default for AwgConfig {
@@ -144,6 +148,7 @@ impl Default for AwgConfig {
             jc: 0,
             jmin: 0,
             jmax: 0,
+            i_packets: [const { None }; 5],
         }
     }
 }
@@ -185,6 +190,17 @@ impl AwgConfig {
         Ok(())
     }
 
+    /// Render I1..I5 custom signature packets, skipping unset slots.
+    ///
+    /// Go reference sends these before junk packets, before the actual
+    /// handshake initiation (`amneziawg-go/device/send.go`).
+    pub fn generate_i_packets(&self) -> Vec<Packet> {
+        self.i_packets
+            .iter()
+            .filter_map(|slot| slot.as_ref().map(ObfChain::render))
+            .collect()
+    }
+
     /// Generate junk packets to send before a handshake initiation.
     ///
     /// Returns an empty Vec if `jc == 0`.
@@ -222,6 +238,8 @@ pub enum AwgConfigError {
         /// The invalid `jmax` value.
         jmax: usize,
     },
+    /// Obfuscation chain spec could not be parsed.
+    InvalidObfSpec(String),
 }
 
 impl fmt::Display for AwgConfigError {
@@ -234,11 +252,182 @@ impl fmt::Display for AwgConfigError {
             Self::InvalidJunkRange { jmin, jmax } => {
                 write!(f, "jmin ({jmin}) must be <= jmax ({jmax})")
             }
+            Self::InvalidObfSpec(s) => write!(f, "invalid obfuscation spec: {s}"),
         }
     }
 }
 
 impl std::error::Error for AwgConfigError {}
+
+/// A single DSL tag in an obfuscation chain.
+///
+/// Tags are rendered into bytes that form a custom signature packet
+/// ([`ObfChain`]). Tags carry no data, so deobfuscation is not supported —
+/// in AmneziaWG, `I`-packets are sent one-way and silently dropped by the
+/// receiver (they don't match any valid message_type).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ObfTag {
+    /// `<b 0xHEX>` — emit the literal bytes decoded from hex.
+    Bytes(Vec<u8>),
+    /// `<r N>` — emit N cryptographically random bytes.
+    Rand(usize),
+    /// `<rc N>` — emit N random ASCII letters `[a-zA-Z]`.
+    RandChars(usize),
+    /// `<rd N>` — emit N random ASCII digits `[0-9]`.
+    RandDigits(usize),
+    /// `<t>` — emit the current Unix timestamp as 4 big-endian bytes.
+    Timestamp,
+}
+
+impl ObfTag {
+    /// Number of bytes produced when this tag is rendered.
+    pub fn len(&self) -> usize {
+        match self {
+            Self::Bytes(b) => b.len(),
+            Self::Rand(n) | Self::RandChars(n) | Self::RandDigits(n) => *n,
+            Self::Timestamp => 4,
+        }
+    }
+
+    /// Whether the tag produces zero bytes.
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    fn render(&self, dst: &mut [u8]) {
+        use rand::RngCore;
+        const CHARS52: &[u8; 52] =
+            b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ";
+        const DIGITS10: &[u8; 10] = b"0123456789";
+
+        match self {
+            Self::Bytes(b) => dst.copy_from_slice(b),
+            Self::Rand(_) => rand::rng().fill_bytes(dst),
+            Self::RandChars(_) => {
+                rand::rng().fill_bytes(dst);
+                for b in dst.iter_mut() {
+                    *b = CHARS52[(*b as usize) % 52];
+                }
+            }
+            Self::RandDigits(_) => {
+                rand::rng().fill_bytes(dst);
+                for b in dst.iter_mut() {
+                    *b = DIGITS10[(*b as usize) % 10];
+                }
+            }
+            Self::Timestamp => {
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs() as u32)
+                    .unwrap_or(0);
+                dst.copy_from_slice(&now.to_be_bytes());
+            }
+        }
+    }
+}
+
+/// A sequence of [`ObfTag`]s that render into a custom signature packet (I1..I5).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ObfChain {
+    spec: String,
+    tags: Vec<ObfTag>,
+}
+
+impl ObfChain {
+    /// Parse a spec string into a chain.
+    ///
+    /// The DSL accepts `<tag [arg]>` forms intermixed with arbitrary text that
+    /// is ignored (matches the Go reference implementation). Tags:
+    ///
+    /// - `<b 0xHEX>` — literal bytes (hex string, even-sized; `0x` prefix optional).
+    /// - `<r N>`     — N random bytes.
+    /// - `<rc N>`    — N random letters.
+    /// - `<rd N>`    — N random digits.
+    /// - `<t>`       — 4-byte big-endian Unix timestamp.
+    pub fn parse(spec: &str) -> Result<Self, AwgConfigError> {
+        let mut tags = Vec::new();
+        let mut remaining = spec;
+        while let Some(start) = remaining.find('<') {
+            let after = &remaining[start + 1..];
+            let end = after
+                .find('>')
+                .ok_or_else(|| AwgConfigError::InvalidObfSpec("missing '>'".to_string()))?;
+            let body = &after[..end];
+            remaining = &after[end + 1..];
+
+            let mut parts = body.split_whitespace();
+            let Some(key) = parts.next() else { continue };
+            let arg = parts.next().unwrap_or("");
+
+            let tag = match key {
+                "b" => {
+                    let hex = arg.strip_prefix("0x").unwrap_or(arg);
+                    if hex.is_empty() {
+                        return Err(AwgConfigError::InvalidObfSpec("<b> empty".to_string()));
+                    }
+                    if hex.len() % 2 != 0 {
+                        return Err(AwgConfigError::InvalidObfSpec(
+                            "<b> odd hex length".to_string(),
+                        ));
+                    }
+                    let bytes = (0..hex.len())
+                        .step_by(2)
+                        .map(|i| u8::from_str_radix(&hex[i..i + 2], 16))
+                        .collect::<Result<Vec<_>, _>>()
+                        .map_err(|_| AwgConfigError::InvalidObfSpec("<b> bad hex".to_string()))?;
+                    ObfTag::Bytes(bytes)
+                }
+                "r" => ObfTag::Rand(parse_len(arg, "<r>")?),
+                "rc" => ObfTag::RandChars(parse_len(arg, "<rc>")?),
+                "rd" => ObfTag::RandDigits(parse_len(arg, "<rd>")?),
+                "t" => ObfTag::Timestamp,
+                other => {
+                    return Err(AwgConfigError::InvalidObfSpec(format!(
+                        "unknown tag <{other}>"
+                    )));
+                }
+            };
+            tags.push(tag);
+        }
+
+        Ok(Self {
+            spec: spec.to_string(),
+            tags,
+        })
+    }
+
+    /// Original spec string, for UAPI round-trip.
+    pub fn spec(&self) -> &str {
+        &self.spec
+    }
+
+    /// Total length of the rendered packet.
+    pub fn len(&self) -> usize {
+        self.tags.iter().map(ObfTag::len).sum()
+    }
+
+    /// Whether the chain renders to zero bytes.
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Render the chain into a freshly allocated `Packet`.
+    pub fn render(&self) -> Packet {
+        let mut buf = BytesMut::zeroed(self.len());
+        let mut off = 0;
+        for tag in &self.tags {
+            let n = tag.len();
+            tag.render(&mut buf[off..off + n]);
+            off += n;
+        }
+        Packet::from_bytes(buf)
+    }
+}
+
+fn parse_len(arg: &str, ctx: &str) -> Result<usize, AwgConfigError> {
+    arg.parse::<usize>()
+        .map_err(|_| AwgConfigError::InvalidObfSpec(format!("{ctx} bad length {arg:?}")))
+}
 
 #[cfg(test)]
 mod tests {
@@ -362,8 +551,102 @@ mod tests {
             jc: 3,
             jmin: 100,
             jmax: 200,
+            i_packets: [const { None }; 5],
         };
         assert!(awg.validate().is_ok());
+        assert!(!awg.is_standard_wg());
+    }
+
+    #[test]
+    fn obf_parse_bytes() {
+        let c = ObfChain::parse("<b 0xDEADBEEF>").unwrap();
+        assert_eq!(c.len(), 4);
+        let p = c.render();
+        assert_eq!(&p[..], &[0xDE, 0xAD, 0xBE, 0xEF]);
+    }
+
+    #[test]
+    fn obf_parse_bytes_no_prefix() {
+        let c = ObfChain::parse("<b AA>").unwrap();
+        let p = c.render();
+        assert_eq!(&p[..], &[0xAA]);
+    }
+
+    #[test]
+    fn obf_parse_rand_digits_chars() {
+        let c = ObfChain::parse("<rd 8><rc 4>").unwrap();
+        assert_eq!(c.len(), 12);
+        let p = c.render();
+        for b in &p[..8] {
+            assert!(b.is_ascii_digit(), "not a digit: {b:x}");
+        }
+        for b in &p[8..12] {
+            assert!(b.is_ascii_alphabetic(), "not a letter: {b:x}");
+        }
+    }
+
+    #[test]
+    fn obf_parse_rand() {
+        let c = ObfChain::parse("<r 32>").unwrap();
+        assert_eq!(c.len(), 32);
+        assert_eq!(c.render().len(), 32);
+    }
+
+    #[test]
+    fn obf_timestamp_be4() {
+        let c = ObfChain::parse("<t>").unwrap();
+        assert_eq!(c.len(), 4);
+        let before = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as u32;
+        let p = c.render();
+        let got = u32::from_be_bytes([p[0], p[1], p[2], p[3]]);
+        let after = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as u32;
+        assert!(before <= got && got <= after);
+    }
+
+    #[test]
+    fn obf_parse_mixed() {
+        let c = ObfChain::parse("<b 0x00><r 4><rd 2><rc 2><t>").unwrap();
+        assert_eq!(c.len(), 1 + 4 + 2 + 2 + 4);
+        assert_eq!(c.spec(), "<b 0x00><r 4><rd 2><rc 2><t>");
+    }
+
+    #[test]
+    fn obf_parse_ignores_surrounding_text() {
+        // The Go reference skips anything outside <...> tags.
+        let c = ObfChain::parse("hello <r 4> world <b AA>").unwrap();
+        assert_eq!(c.len(), 5);
+    }
+
+    #[test]
+    fn obf_parse_errors() {
+        assert!(ObfChain::parse("<r abc>").is_err());
+        assert!(ObfChain::parse("<b 0xA>").is_err()); // odd hex
+        assert!(ObfChain::parse("<b>").is_err()); // empty hex
+        assert!(ObfChain::parse("<unknown>").is_err());
+        assert!(ObfChain::parse("<r 4").is_err()); // unclosed
+    }
+
+    #[test]
+    fn generate_i_packets_skips_none() {
+        let mut awg = AwgConfig::default();
+        awg.i_packets[0] = Some(ObfChain::parse("<b AA>").unwrap());
+        awg.i_packets[3] = Some(ObfChain::parse("<r 4>").unwrap());
+        let pkts = awg.generate_i_packets();
+        assert_eq!(pkts.len(), 2);
+        assert_eq!(pkts[0].len(), 1);
+        assert_eq!(pkts[1].len(), 4);
+    }
+
+    #[test]
+    fn i_packets_not_standard() {
+        let mut awg = AwgConfig::default();
+        awg.i_packets[0] = Some(ObfChain::parse("<b AA>").unwrap());
         assert!(!awg.is_standard_wg());
     }
 }
