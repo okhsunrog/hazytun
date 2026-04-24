@@ -216,7 +216,12 @@ pub enum AwgConfigError {
     /// Two header ranges overlap.
     OverlappingHeaders(String, String),
     /// jmin > jmax.
-    InvalidJunkRange { jmin: usize, jmax: usize },
+    InvalidJunkRange {
+        /// The invalid `jmin` value.
+        jmin: usize,
+        /// The invalid `jmax` value.
+        jmax: usize,
+    },
 }
 
 impl fmt::Display for AwgConfigError {
