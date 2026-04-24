@@ -1,3 +1,15 @@
+# ── Stage 1: build amneziawg-go ────────────────────────────────────────────
+FROM golang:1.23-bookworm AS awg-go-build
+
+ARG AMNEZIAWG_GO_REF=v0.2.17
+RUN apt-get update && apt-get install -y --no-install-recommends git ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+RUN git clone --depth 1 --branch "${AMNEZIAWG_GO_REF}" \
+    https://github.com/amnezia-vpn/amneziawg-go /src/amneziawg-go
+WORKDIR /src/amneziawg-go
+RUN CGO_ENABLED=0 go build -o /out/amneziawg-go .
+
+# ── Stage 2: e2e test runner ───────────────────────────────────────────────
 FROM rust:1-bookworm
 
 # Install Docker CLI + daemon, networking tools, kmod for kernel module loading
@@ -5,7 +17,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     docker.io \
     iproute2 \
     iputils-ping \
+    socat \
     && rm -rf /var/lib/apt/lists/*
+
+COPY --from=awg-go-build /out/amneziawg-go /usr/local/bin/amneziawg-go
 
 WORKDIR /workspace
 COPY . .

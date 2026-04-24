@@ -967,4 +967,282 @@ mod tests {
             "AWG handshake never completed on device B: {get_b}"
         );
     }
+
+    // ────────────────────────── amneziawg-go interop ──────────────────────────
+    //
+    // Tests below bring up one gotatun (in-process) and one `amneziawg-go`
+    // subprocess, peer them via localhost UDP, and verify that the handshake
+    // completes on both sides. The subprocess is installed into
+    // /usr/local/bin/amneziawg-go by Dockerfile.e2e.
+
+    /// Handle to an `amneziawg-go` subprocess and its UAPI socket.
+    struct AwgGoHandle {
+        name: String,
+        child: Option<std::process::Child>,
+    }
+
+    impl AwgGoHandle {
+        /// Spawn `amneziawg-go -f <iface>` and wait until its UAPI socket
+        /// appears at /var/run/amneziawg/<iface>.sock (up to ~5s).
+        async fn start(iface: String) -> Self {
+            // Make sure no stale TUN with that name exists.
+            let _ = Command::new("ip").args(["link", "del", &iface]).status();
+
+            let child = Command::new("amneziawg-go")
+                .args(["-f", &iface])
+                // WG_PROCESS_FOREGROUND suppresses the stderr "running as
+                // root" warning banner and extra shell-prompt logic.
+                .env("WG_PROCESS_FOREGROUND", "1")
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+                .expect("failed to spawn amneziawg-go");
+
+            let sock_path = format!("/var/run/amneziawg/{iface}.sock");
+            for _ in 0..50 {
+                if std::path::Path::new(&sock_path).exists() {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            }
+            assert!(
+                std::path::Path::new(&sock_path).exists(),
+                "amneziawg-go UAPI socket never appeared at {sock_path}"
+            );
+
+            Self {
+                name: iface,
+                child: Some(child),
+            }
+        }
+
+        fn socket_path(&self) -> String {
+            format!("/var/run/amneziawg/{}.sock", self.name)
+        }
+
+        async fn uapi_set(&self, setting: &str) -> String {
+            let mut sock = UnixStream::connect(self.socket_path())
+                .await
+                .expect("connect amneziawg-go UAPI");
+            sock.write_all(format!("set=1\n{setting}\n\n").as_bytes())
+                .await
+                .unwrap();
+            let mut ret = String::new();
+            let mut reader = tokio::io::BufReader::new(sock);
+            while reader.read_line(&mut ret).await.unwrap() > 1 {}
+            ret
+        }
+
+        async fn uapi_get(&self) -> String {
+            let mut sock = UnixStream::connect(self.socket_path())
+                .await
+                .expect("connect amneziawg-go UAPI");
+            sock.write_all(b"get=1\n\n").await.unwrap();
+            let mut ret = String::new();
+            let mut reader = tokio::io::BufReader::new(sock);
+            while reader.read_line(&mut ret).await.unwrap() > 1 {}
+            ret
+        }
+    }
+
+    impl Drop for AwgGoHandle {
+        fn drop(&mut self) {
+            if let Some(mut child) = self.child.take() {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+            let _ = Command::new("ip")
+                .args(["link", "del", &self.name])
+                .status();
+            let _ = std::fs::remove_file(self.socket_path());
+        }
+    }
+
+    /// Build a UAPI `set=1` block with optional AWG params.
+    ///
+    /// gotatun's UAPI rejects unknown keys, so AWG params must only be
+    /// included when targeting `amneziawg-go`; gotatun itself receives its
+    /// AWG config at build time via `DeviceBuilder::with_awg`.
+    fn build_uapi_config(
+        listen_port: u16,
+        private_key: &StaticSecret,
+        peer_pub: &PublicKey,
+        peer_endpoint: SocketAddr,
+        awg: &AwgConfig,
+        include_awg: bool,
+    ) -> String {
+        let mut cfg = String::new();
+        let _ = writeln!(cfg, "listen_port={listen_port}");
+        let _ = writeln!(cfg, "private_key={}", encode(private_key.to_bytes()));
+        if include_awg && !awg.is_standard_wg() {
+            let _ = writeln!(cfg, "h1={}", awg.h1);
+            let _ = writeln!(cfg, "h2={}", awg.h2);
+            let _ = writeln!(cfg, "h3={}", awg.h3);
+            let _ = writeln!(cfg, "h4={}", awg.h4);
+            let _ = writeln!(cfg, "s1={}", awg.s1);
+            let _ = writeln!(cfg, "s2={}", awg.s2);
+            let _ = writeln!(cfg, "s3={}", awg.s3);
+            let _ = writeln!(cfg, "s4={}", awg.s4);
+            let _ = writeln!(cfg, "jc={}", awg.jc);
+            let _ = writeln!(cfg, "jmin={}", awg.jmin);
+            let _ = writeln!(cfg, "jmax={}", awg.jmax);
+            for (idx, slot) in awg.i_packets.iter().enumerate() {
+                if let Some(chain) = slot {
+                    let _ = writeln!(cfg, "i{}={}", idx + 1, chain.spec());
+                }
+            }
+        }
+        let _ = writeln!(cfg, "public_key={}", encode(peer_pub.as_bytes()));
+        let _ = writeln!(cfg, "endpoint={peer_endpoint}");
+        let _ = writeln!(cfg, "allowed_ip=0.0.0.0/0");
+        let _ = writeln!(cfg, "persistent_keepalive_interval=1");
+        cfg.truncate(cfg.trim_end().len()); // strip trailing newline
+        cfg
+    }
+
+    /// Shared driver for the three interop tests.
+    async fn run_interop(awg: AwgConfig, label: &str) {
+        let rs_iface = format!("utun{}", NEXT_IFACE_IDX.fetch_add(1, Ordering::Relaxed));
+        let go_iface = format!("wggo{}", NEXT_IFACE_IDX.fetch_add(1, Ordering::Relaxed));
+
+        let port_rs = next_port();
+        let port_go = next_port();
+
+        let key_rs = StaticSecret::random_from_rng(rand_core::OsRng);
+        let key_go = StaticSecret::random_from_rng(rand_core::OsRng);
+        let pub_rs = PublicKey::from(&key_rs);
+        let pub_go = PublicKey::from(&key_go);
+
+        // Rust side (in-process).
+        let uapi =
+            crate::device::uapi::UapiServer::default_unix_socket(&rs_iface, None, None).unwrap();
+        let mut builder = DeviceBuilder::new()
+            .create_tun(&rs_iface)
+            .unwrap()
+            .with_udp(UdpSocketFactory)
+            .with_uapi(uapi);
+        builder = builder.with_awg(awg.clone());
+        let _rs_device = builder.build().await.unwrap();
+
+        // Go side (subprocess).
+        let awg_go = AwgGoHandle::start(go_iface.clone()).await;
+
+        // Both speak UAPI; push identical configs (with the other as peer).
+        let ep_go = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port_go);
+        let ep_rs = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port_rs);
+
+        let rs_cfg = build_uapi_config(port_rs, &key_rs, &pub_go, ep_go, &awg, false);
+        let go_cfg = build_uapi_config(port_go, &key_go, &pub_rs, ep_rs, &awg, true);
+
+        // Push Rust config through our existing UAPI path.
+        let rs_sock_path = format!("/var/run/wireguard/{rs_iface}.sock");
+        let rs_reply = {
+            let mut sock = UnixStream::connect(&rs_sock_path)
+                .await
+                .expect("connect gotatun UAPI");
+            sock.write_all(format!("set=1\n{rs_cfg}\n\n").as_bytes())
+                .await
+                .unwrap();
+            let mut ret = String::new();
+            let mut reader = tokio::io::BufReader::new(sock);
+            while reader.read_line(&mut ret).await.unwrap() > 1 {}
+            ret
+        };
+        assert_eq!(
+            rs_reply.trim(),
+            "errno=0",
+            "gotatun rejected config: {rs_reply}"
+        );
+
+        let go_reply = awg_go.uapi_set(&go_cfg).await;
+        assert_eq!(
+            go_reply.trim(),
+            "errno=0",
+            "amneziawg-go rejected config: {go_reply}"
+        );
+
+        // Wait for persistent_keepalive to drive a handshake on both sides.
+        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+
+        // Assert both sides observed a completed handshake.
+        let rs_get = {
+            let mut sock = UnixStream::connect(&rs_sock_path).await.unwrap();
+            sock.write_all(b"get=1\n\n").await.unwrap();
+            let mut ret = String::new();
+            let mut reader = tokio::io::BufReader::new(sock);
+            while reader.read_line(&mut ret).await.unwrap() > 1 {}
+            ret
+        };
+        assert!(
+            rs_get.contains("last_handshake_time_sec=")
+                && !rs_get.contains("last_handshake_time_sec=0\n"),
+            "[{label}] gotatun handshake never completed:\n{rs_get}"
+        );
+
+        let go_get = awg_go.uapi_get().await;
+        assert!(
+            go_get.contains("last_handshake_time_sec=")
+                && !go_get.contains("last_handshake_time_sec=0\n"),
+            "[{label}] amneziawg-go handshake never completed:\n{go_get}"
+        );
+    }
+
+    /// Interop: plain WireGuard, no obfuscation.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[ignore]
+    async fn interop_amneziawg_go_baseline() {
+        run_interop(AwgConfig::default(), "baseline").await;
+    }
+
+    /// Interop: AmneziaWG 1.x — custom headers + paddings + junk packets.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[ignore]
+    async fn interop_amneziawg_go_v1() {
+        let awg = AwgConfig {
+            h1: MagicHeader::fixed(0x1234_5678),
+            h2: MagicHeader::fixed(0x2345_6789),
+            h3: MagicHeader::fixed(0x3456_789A),
+            h4: MagicHeader::fixed(0x4567_89AB),
+            s1: 16,
+            s2: 16,
+            s3: 0,
+            s4: 0,
+            jc: 3,
+            jmin: 40,
+            jmax: 80,
+            i_packets: [const { None }; 5],
+        };
+        assert!(awg.validate().is_ok());
+        run_interop(awg, "awg-1.x").await;
+    }
+
+    /// Interop: AmneziaWG 2.0 — v1 config plus I1..I5 custom signature packets.
+    /// If this passes, our DSL parser + renderer is byte-for-byte compatible
+    /// with the Go reference implementation.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[ignore]
+    async fn interop_amneziawg_go_v2() {
+        use crate::noise::awg::ObfChain;
+        let mut awg = AwgConfig {
+            h1: MagicHeader::fixed(0x1234_5678),
+            h2: MagicHeader::fixed(0x2345_6789),
+            h3: MagicHeader::fixed(0x3456_789A),
+            h4: MagicHeader::fixed(0x4567_89AB),
+            s1: 16,
+            s2: 16,
+            s3: 0,
+            s4: 0,
+            jc: 2,
+            jmin: 50,
+            jmax: 50,
+            i_packets: [const { None }; 5],
+        };
+        awg.i_packets[0] = Some(ObfChain::parse("<b 0xDEADBEEF><r 8>").unwrap());
+        awg.i_packets[1] = Some(ObfChain::parse("<rd 10>").unwrap());
+        // I3 None — skipped.
+        awg.i_packets[3] = Some(ObfChain::parse("<rc 6><t>").unwrap());
+        awg.i_packets[4] = Some(ObfChain::parse("<b 0xCAFE>").unwrap());
+        assert!(awg.validate().is_ok());
+        run_interop(awg, "awg-2.0").await;
+    }
 }
