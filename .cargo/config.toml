@@ -1,2 +1,2 @@
 [target.'cfg(unix)']
-runner = 'unshare -Urn'
+runner = 'scripts/cargo-test-runner.sh'
