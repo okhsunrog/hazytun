@@ -253,8 +253,8 @@ impl<R: RngCore + Send> Tunn<R> {
         log::debug!("Received handshake_initiation: {}", p.sender_idx);
 
         let n_bytes = p.as_bytes().len();
-        let (mut packet, session) = self.handshake.receive_handshake_initialization(p)?;
-        self.apply_awg_header(&mut packet, self.awg.h2.generate());
+        let h2 = self.awg.h2.generate();
+        let (packet, session) = self.handshake.receive_handshake_initialization(p, h2)?;
         self.rx_bytes += n_bytes;
 
         // Store new session in next slot
@@ -405,8 +405,8 @@ impl<R: RngCore + Send> Tunn<R> {
 
         let starting_new_handshake = !self.handshake.is_in_progress();
 
-        let mut packet = self.handshake.format_handshake_initiation();
-        self.apply_awg_header(&mut packet, self.awg.h1.generate());
+        let h1 = self.awg.h1.generate();
+        let packet = self.handshake.format_handshake_initiation(h1);
         log::debug!("Sending handshake_initiation");
 
         if starting_new_handshake {

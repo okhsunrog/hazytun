@@ -347,6 +347,15 @@ pub trait WgHandshakeBase:
     fn until_mac2(&self) -> &[u8] {
         &self.as_bytes()[..Self::MAC2_OFF]
     }
+
+    /// Overwrite the first 4 bytes (`packet_type` + `_reserved_zeros`) with
+    /// `val` as a little-endian u32. This must be called **before**
+    /// MAC1/MAC2 computation when AmneziaWG header obfuscation is active —
+    /// the MACs are computed over the full prefix including these bytes.
+    #[inline(always)]
+    fn set_type_u32(&mut self, val: u32) {
+        self.as_mut_bytes()[..4].copy_from_slice(&val.to_le_bytes());
+    }
 }
 
 /// WireGuard handshake initialization packet.
@@ -548,62 +557,47 @@ impl Packet {
 
         // Try each message type with size and header validation.
         // For AWG: header is at padding offset, total size includes padding.
-        // After stripping padding, restore the original WG header (type byte + 3 zero bytes)
-        // so that MAC verification and other internal processing work correctly.
+        // After stripping padding, keep the received header bytes intact — MAC
+        // verification is computed over them, and the type dispatch happens
+        // via this enum rather than via re-reading the type field.
         if len == awg.s1 + WgHandshakeInit::LEN && awg.h1.validate(header_at(&self, awg.s1)) {
-            let mut packet = if awg.s1 > 0 {
+            let packet = if awg.s1 > 0 {
                 self.slice_from(awg.s1)
             } else {
                 self
             };
-            restore_wg_header(&mut packet, WgPacketType::HandshakeInit);
             return Ok(WgKind::HandshakeInit(packet.cast()));
         }
 
         if len == awg.s2 + WgHandshakeResp::LEN && awg.h2.validate(header_at(&self, awg.s2)) {
-            let mut packet = if awg.s2 > 0 {
+            let packet = if awg.s2 > 0 {
                 self.slice_from(awg.s2)
             } else {
                 self
             };
-            restore_wg_header(&mut packet, WgPacketType::HandshakeResp);
             return Ok(WgKind::HandshakeResp(packet.cast()));
         }
 
         if len == awg.s3 + WgCookieReply::LEN && awg.h3.validate(header_at(&self, awg.s3)) {
-            let mut packet = if awg.s3 > 0 {
+            let packet = if awg.s3 > 0 {
                 self.slice_from(awg.s3)
             } else {
                 self
             };
-            restore_wg_header(&mut packet, WgPacketType::CookieReply);
             return Ok(WgKind::CookieReply(packet.cast()));
         }
 
         if len >= awg.s4 + WgData::OVERHEAD && awg.h4.validate(header_at(&self, awg.s4)) {
-            let mut packet = if awg.s4 > 0 {
+            let packet = if awg.s4 > 0 {
                 self.slice_from(awg.s4)
             } else {
                 self
             };
-            restore_wg_header(&mut packet, WgPacketType::Data);
             return Ok(WgKind::Data(packet.cast()));
         }
 
         bail!("Not a wireguard packet, bad type/size.");
     }
-}
-
-/// Restore the standard WireGuard header (type byte + 3 zero bytes) after AWG obfuscation.
-///
-/// This must be done before MAC verification and other internal processing, because
-/// MACs are computed over the packet with the original WG header, not the AWG header.
-fn restore_wg_header(packet: &mut Packet, wg_type: WgPacketType) {
-    let buf = packet.buf_mut();
-    buf[0] = wg_type.0;
-    buf[1] = 0;
-    buf[2] = 0;
-    buf[3] = 0;
 }
 
 /// Read the header type (first 4 bytes as LE u32) at a given padding offset.

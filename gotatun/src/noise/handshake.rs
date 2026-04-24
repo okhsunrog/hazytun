@@ -502,6 +502,7 @@ impl Handshake {
     pub(super) fn receive_handshake_initialization(
         &mut self,
         packet: crate::packet::Packet<WgHandshakeInit>,
+        awg_response_header: u32,
     ) -> Result<(crate::packet::Packet<WgHandshakeResp>, Session), WireGuardError> {
         // initiator.chaining_key = HASH(CONSTRUCTION)
         let mut chaining_key = INITIAL_CHAIN_KEY;
@@ -580,7 +581,7 @@ impl Handshake {
             },
         );
 
-        Ok(self.format_handshake_response(packet.into_bytes()))
+        Ok(self.format_handshake_response(packet.into_bytes(), awg_response_header))
     }
 
     pub(super) fn receive_handshake_response(
@@ -733,7 +734,10 @@ impl Handshake {
         self.cookies.last_mac1 = Some(*packet.mac1());
     }
 
-    pub(super) fn format_handshake_initiation(&mut self) -> crate::packet::Packet<WgHandshakeInit> {
+    pub(super) fn format_handshake_initiation(
+        &mut self,
+        awg_header: u32,
+    ) -> crate::packet::Packet<WgHandshakeInit> {
         let mut handshake = WgHandshakeInit::new();
 
         let local_index = self.index_table.new_index();
@@ -809,6 +813,9 @@ impl Handshake {
             }),
         );
 
+        // AWG: override the message type before computing MACs — MAC1 is
+        // computed over `until_mac1()` which includes the type bytes.
+        handshake.set_type_u32(awg_header);
         self.init_mac1_and_mac2(&mut handshake, local_index_val);
 
         Packet::copy_from(&handshake)
@@ -817,6 +824,7 @@ impl Handshake {
     fn format_handshake_response(
         &mut self,
         buf: crate::packet::Packet,
+        awg_header: u32,
     ) -> (crate::packet::Packet<WgHandshakeResp>, Session) {
         let state = std::mem::replace(&mut self.state, HandshakeState::None);
         let (mut chaining_key, mut hash, peer_ephemeral_public, peer_index) = match state {
@@ -893,6 +901,8 @@ impl Handshake {
         let temp2 = b2s_hmac(&temp1, &[0x01]);
         let temp3 = b2s_hmac2(&temp1, &temp2, &[0x02]);
 
+        // AWG: override the message type before computing MACs.
+        resp.set_type_u32(awg_header);
         self.init_mac1_and_mac2(&mut resp, local_index_val);
 
         let packet = buf.overwrite_with(&resp);
